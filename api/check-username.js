@@ -3,7 +3,7 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST');
   
-  const USERNAME_TO_CHECK = 'zubinmowlavizubinmowlavi';
+  const USERNAME_TO_CHECK = 'zubinmowlavizubinmowlavi';  // Test with non-existent username
   const SECRET_KEY = process.env.SECRET_KEY || 'your-secret-key-here';
   
   const { key, sendAlert, debug } = req.query;
@@ -18,7 +18,6 @@ export default async function handler(req, res) {
     const result = await checkUsernameWithFallbacks(USERNAME_TO_CHECK);
     
     // Only send SMS if we're confident the username is actually available
-    // (not just blocked by 403)
     if (sendAlert === 'true' && result.available === true && result.confidence === 'high') {
       try {
         await sendSMS(`🚨 @${USERNAME_TO_CHECK} is NOW AVAILABLE on X! Claim it at x.com/${USERNAME_TO_CHECK}`);
@@ -55,48 +54,40 @@ export default async function handler(req, res) {
 async function checkUsernameWithFallbacks(username) {
   const debugInfo = {};
   
-  // Method 1: Direct check (will likely get 403)
   try {
+    // Method 1: Direct check (will likely get blocked)
     const directResult = await checkDirectly(username);
     debugInfo.directCheck = directResult;
     
-    // If we get 403 OR a suspicious generic page size, we can't trust the result
-    // 248732 is the size of X's generic/blocked page
-    if (directResult.statusCode === 403 || directResult.size === 248732) {
+    // Check if we got X's generic blocking page (around 248KB)
+    const isGenericPage = directResult.size > 248000 && directResult.size < 250000 && !directResult.hasProfile;
+    
+    if (directResult.statusCode === 403 || isGenericPage) {
       debugInfo.blocked = true;
-      debugInfo.blockReason = directResult.size === 248732 ? 'Generic page detected' : '403 Forbidden';
+      debugInfo.blockReason = isGenericPage ? `Generic page detected (${directResult.size} bytes)` : '403 Forbidden';
       
-      // Method 2: Try using a proxy service (free tier)
-      const proxyResult = await checkViaProxy(username);
-      debugInfo.proxyCheck = proxyResult;
-      
-      if (proxyResult.success) {
-        return {
-          available: proxyResult.available,
-          confidence: 'high',
-          message: proxyResult.available ? 'Username is available!' : 'Username is taken',
-          debug: debugInfo
-        };
+      // Method 2: Try using a proxy service
+      try {
+        const proxyResult = await checkViaProxy(username);
+        debugInfo.proxyCheck = proxyResult;
+        
+        if (proxyResult.success) {
+          return {
+            available: proxyResult.available,
+            confidence: 'high',
+            message: proxyResult.available ? 'Username is available!' : 'Username is taken',
+            debug: debugInfo
+          };
+        }
+      } catch (proxyError) {
+        debugInfo.proxyError = proxyError.message;
       }
       
-      // Method 3: Check via alternative endpoint
-      const altResult = await checkViaAlternative(username);
-      debugInfo.altCheck = altResult;
-      
-      if (altResult.success) {
-        return {
-          available: altResult.available,
-          confidence: 'medium',
-          message: altResult.available ? 'Username appears to be available' : 'Username appears to be taken',
-          debug: debugInfo
-        };
-      }
-      
-      // If all methods fail, return blocked status
+      // If proxy fails, we can't determine status
       return {
         available: false,
         confidence: 'low',
-        message: '⚠️ Cannot verify - X.com is blocking checks from Vercel. Try checking manually or use a different monitoring method.',
+        message: '⚠️ Cannot verify - X.com is blocking checks from Vercel',
         debug: debugInfo
       };
     }
@@ -111,7 +102,7 @@ async function checkUsernameWithFallbacks(username) {
       };
     }
     
-    if (directResult.statusCode === 200) {
+    if (directResult.statusCode === 200 && directResult.hasProfile) {
       return {
         available: false,
         confidence: 'high',
@@ -120,16 +111,23 @@ async function checkUsernameWithFallbacks(username) {
       };
     }
     
+    // Default case
+    return {
+      available: false,
+      confidence: 'low',
+      message: 'Unable to determine status',
+      debug: debugInfo
+    };
+    
   } catch (error) {
     debugInfo.error = error.message;
+    return {
+      available: false,
+      confidence: 'low',
+      message: 'Error checking username',
+      debug: debugInfo
+    };
   }
-  
-  return {
-    available: false,
-    confidence: 'low',
-    message: 'Unable to check username status',
-    debug: debugInfo
-  };
 }
 
 async function checkDirectly(username) {
@@ -141,14 +139,12 @@ async function checkDirectly(username) {
     });
     
     const html = await response.text();
-    
-    // Get first 1000 chars to see what page we're getting
     const preview = html.substring(0, 1000);
     
     return {
       statusCode: response.status,
       size: html.length,
-      hasProfile: html.toLowerCase().includes(`"${username.toLowerCase()}"`),
+      hasProfile: html.toLowerCase().includes(`@${username.toLowerCase()}`),
       preview: preview,
       title: html.match(/<title>(.*?)<\/title>/)?.[1] || 'No title found'
     };
@@ -158,17 +154,26 @@ async function checkDirectly(username) {
 }
 
 async function checkViaProxy(username) {
-  // Using AllOrigins as a free CORS proxy
   try {
+    // Using AllOrigins as a free CORS proxy
     const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(`https://x.com/${username}`)}`;
-    const response = await fetch(proxyUrl);
+    
+    const response = await fetch(proxyUrl, {
+      timeout: 10000  // 10 second timeout
+    });
     
     if (!response.ok) {
       return { success: false, error: 'Proxy request failed' };
     }
     
     const data = await response.json();
-    const content = data.contents.toLowerCase();
+    const content = (data.contents || '').toLowerCase();
+    
+    // Check if account doesn't exist
+    if (content.includes("this account doesn't exist") || 
+        content.includes("this page doesn't exist")) {
+      return { success: true, available: true };
+    }
     
     // Check if the profile exists
     if (content.includes(`@${username.toLowerCase()}`) && 
@@ -176,11 +181,7 @@ async function checkViaProxy(username) {
       return { success: true, available: false };
     }
     
-    if (content.includes("this account doesn't exist") || 
-        content.includes("this page doesn't exist")) {
-      return { success: true, available: true };
-    }
-    
+    // Check if suspended
     if (content.includes('suspended')) {
       return { success: true, available: false };
     }
@@ -190,32 +191,11 @@ async function checkViaProxy(username) {
       return { success: true, available: true };
     }
     
-    return { success: false, error: 'Could not determine status' };
-    
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-}
-
-async function checkViaAlternative(username) {
-  // Try checking via X's API endpoints (public data)
-  try {
-    // X's public API endpoint for user info (might also be blocked)
-    const response = await fetch(`https://x.com/i/api/graphql/G3KGOASz96M-Qu0nwmGXNg/UserByScreenName?variables=${encodeURIComponent(JSON.stringify({screen_name: username}))}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-    
-    if (response.status === 404) {
-      return { success: true, available: true };
-    }
-    
-    if (response.status === 200) {
-      return { success: true, available: false };
-    }
-    
-    return { success: false, statusCode: response.status };
+    return { 
+      success: false, 
+      error: 'Could not determine status',
+      contentLength: content.length 
+    };
     
   } catch (error) {
     return { success: false, error: error.message };
