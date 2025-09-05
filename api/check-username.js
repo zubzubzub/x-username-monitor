@@ -243,4 +243,13 @@ async function sendSMS(message) {
     console.error('SMS error:', error);
     throw error;
   }
+
+  export default function handler(req, res) {
+  res.status(200).json({
+    test: 'This is the NEW code',
+    username_checking: 'zubinmowlavizubinmowlavi',
+    deployed_at: '2025-09-05 v1',
+    timestamp: new Date().toISOString()
+  });
+}
 }
