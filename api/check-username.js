@@ -14,11 +14,12 @@ export default async function handler(req, res) {
   }
   
   try {
-    // Check username availability
-    const result = await checkUsernameAvailability(USERNAME_TO_CHECK);
+    // Try multiple methods to check availability
+    const result = await checkUsernameWithFallbacks(USERNAME_TO_CHECK);
     
-    // Send SMS if requested and username is available
-    if (sendAlert === 'true' && result.available === true) {
+    // Only send SMS if we're confident the username is actually available
+    // (not just blocked by 403)
+    if (sendAlert === 'true' && result.available === true && result.confidence === 'high') {
       try {
         await sendSMS(`🚨 @${USERNAME_TO_CHECK} is NOW AVAILABLE on X! Claim it at x.com/${USERNAME_TO_CHECK}`);
       } catch (smsError) {
@@ -30,8 +31,9 @@ export default async function handler(req, res) {
     const response = {
       username: USERNAME_TO_CHECK,
       available: result.available,
+      confidence: result.confidence,
       timestamp: new Date().toISOString(),
-      message: result.available ? 'Username is available!' : 'Username is taken or suspended'
+      message: result.message
     };
     
     // Add debug info if requested
@@ -50,79 +52,170 @@ export default async function handler(req, res) {
   }
 }
 
-async function checkUsernameAvailability(username) {
+async function checkUsernameWithFallbacks(username) {
   const debugInfo = {};
   
+  // Method 1: Direct check (will likely get 403)
   try {
-    const url = `https://x.com/${username}`;
-    debugInfo.checkingUrl = url;
+    const directResult = await checkDirectly(username);
+    debugInfo.directCheck = directResult;
     
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+    // If we get 403, we can't trust the result
+    if (directResult.statusCode === 403) {
+      debugInfo.blocked = true;
+      
+      // Method 2: Try using a proxy service (free tier)
+      const proxyResult = await checkViaProxy(username);
+      debugInfo.proxyCheck = proxyResult;
+      
+      if (proxyResult.success) {
+        return {
+          available: proxyResult.available,
+          confidence: 'high',
+          message: proxyResult.available ? 'Username is available!' : 'Username is taken',
+          debug: debugInfo
+        };
       }
-    });
-    
-    debugInfo.statusCode = response.status;
-    
-    // Read the response
-    const html = await response.text();
-    debugInfo.responseSize = html.length;
-    
-    // Simple check: look for clear indicators the username exists
-    const pageContent = html.toLowerCase();
-    
-    // Strong indicators the account EXISTS
-    if (pageContent.includes(`"screen_name":"${username.toLowerCase()}"`) ||
-        pageContent.includes(`@${username.toLowerCase()}`) && pageContent.includes('followers')) {
-      debugInfo.detected = 'Account exists - found username in page data';
-      return { available: false, debug: debugInfo };
+      
+      // Method 3: Check via alternative endpoint
+      const altResult = await checkViaAlternative(username);
+      debugInfo.altCheck = altResult;
+      
+      if (altResult.success) {
+        return {
+          available: altResult.available,
+          confidence: 'medium',
+          message: altResult.available ? 'Username appears to be available' : 'Username appears to be taken',
+          debug: debugInfo
+        };
+      }
+      
+      // If all methods fail, return blocked status
+      return {
+        available: false,
+        confidence: 'low',
+        message: '⚠️ Cannot verify - X.com is blocking checks from Vercel. Try checking manually or use a different monitoring method.',
+        debug: debugInfo
+      };
     }
     
-    // Check if page says account doesn't exist
-    if (pageContent.includes("this account doesn't exist") ||
-        pageContent.includes("this account does not exist")) {
-      debugInfo.detected = 'Account does not exist message found';
-      return { available: true, debug: debugInfo };
+    // If direct check worked (rare from Vercel)
+    if (directResult.statusCode === 404) {
+      return {
+        available: true,
+        confidence: 'high',
+        message: 'Username is available!',
+        debug: debugInfo
+      };
     }
     
-    // Check if account is suspended
-    if (pageContent.includes('account suspended') || 
-        pageContent.includes('account has been suspended')) {
-      debugInfo.detected = 'Account is suspended';
-      return { available: false, debug: debugInfo };
-    }
-    
-    // If we get a 404, username might be available
-    if (response.status === 404) {
-      debugInfo.detected = '404 status - username likely available';
-      return { available: true, debug: debugInfo };
-    }
-    
-    // Default: if page loads with content, assume taken
-    if (html.length > 10000) {
-      debugInfo.detected = 'Large page size - likely a profile';
-      return { available: false, debug: debugInfo };
-    } else {
-      debugInfo.detected = 'Small page size - might be error page';
-      return { available: true, debug: debugInfo };
+    if (directResult.statusCode === 200) {
+      return {
+        available: false,
+        confidence: 'high',
+        message: 'Username is taken',
+        debug: debugInfo
+      };
     }
     
   } catch (error) {
-    console.error('Error in availability check:', error);
-    // On error, assume not available to avoid false positives
-    return { 
-      available: false, 
-      debug: { 
-        error: error.message,
-        ...debugInfo 
+    debugInfo.error = error.message;
+  }
+  
+  return {
+    available: false,
+    confidence: 'low',
+    message: 'Unable to check username status',
+    debug: debugInfo
+  };
+}
+
+async function checkDirectly(username) {
+  try {
+    const response = await fetch(`https://x.com/${username}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
+    });
+    
+    const html = await response.text();
+    
+    return {
+      statusCode: response.status,
+      size: html.length,
+      hasProfile: html.toLowerCase().includes(`"${username.toLowerCase()}"`)
     };
+  } catch (error) {
+    return { error: error.message };
+  }
+}
+
+async function checkViaProxy(username) {
+  // Using AllOrigins as a free CORS proxy
+  try {
+    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(`https://x.com/${username}`)}`;
+    const response = await fetch(proxyUrl);
+    
+    if (!response.ok) {
+      return { success: false, error: 'Proxy request failed' };
+    }
+    
+    const data = await response.json();
+    const content = data.contents.toLowerCase();
+    
+    // Check if the profile exists
+    if (content.includes(`@${username.toLowerCase()}`) && 
+        (content.includes('followers') || content.includes('following'))) {
+      return { success: true, available: false };
+    }
+    
+    if (content.includes("this account doesn't exist") || 
+        content.includes("this page doesn't exist")) {
+      return { success: true, available: true };
+    }
+    
+    if (content.includes('suspended')) {
+      return { success: true, available: false };
+    }
+    
+    // Check status code from proxy
+    if (data.status && data.status.http_code === 404) {
+      return { success: true, available: true };
+    }
+    
+    return { success: false, error: 'Could not determine status' };
+    
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+async function checkViaAlternative(username) {
+  // Try checking via X's API endpoints (public data)
+  try {
+    // X's public API endpoint for user info (might also be blocked)
+    const response = await fetch(`https://x.com/i/api/graphql/G3KGOASz96M-Qu0nwmGXNg/UserByScreenName?variables=${encodeURIComponent(JSON.stringify({screen_name: username}))}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    
+    if (response.status === 404) {
+      return { success: true, available: true };
+    }
+    
+    if (response.status === 200) {
+      return { success: true, available: false };
+    }
+    
+    return { success: false, statusCode: response.status };
+    
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 }
 
 async function sendSMS(message) {
-  // Only try Twilio if configured
   if (!process.env.TWILIO_ACCOUNT_SID || !process.env.YOUR_PHONE_NUMBER) {
     console.log('SMS not configured');
     return null;
@@ -134,10 +227,8 @@ async function sendSMS(message) {
     const fromPhone = process.env.TWILIO_PHONE_FROM;
     const toPhone = process.env.YOUR_PHONE_NUMBER;
     
-    // Create auth header
     const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
     
-    // Send SMS via Twilio
     const response = await fetch(
       `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
       {
