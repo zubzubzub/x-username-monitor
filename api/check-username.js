@@ -3,7 +3,7 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST');
   
-  const USERNAME_TO_CHECK = 'zubinmowlavizubinmowlavi';
+  const USERNAME_TO_CHECK = 'zubin';
   const SECRET_KEY = process.env.SECRET_KEY || 'your-secret-key-here';
   
   const { key, sendAlert, debug } = req.query;
@@ -60,9 +60,11 @@ async function checkUsernameWithFallbacks(username) {
     const directResult = await checkDirectly(username);
     debugInfo.directCheck = directResult;
     
-    // If we get 403, we can't trust the result
-    if (directResult.statusCode === 403) {
+    // If we get 403 OR a suspicious generic page size, we can't trust the result
+    // 248732 is the size of X's generic/blocked page
+    if (directResult.statusCode === 403 || directResult.size === 248732) {
       debugInfo.blocked = true;
+      debugInfo.blockReason = directResult.size === 248732 ? 'Generic page detected' : '403 Forbidden';
       
       // Method 2: Try using a proxy service (free tier)
       const proxyResult = await checkViaProxy(username);
@@ -140,10 +142,15 @@ async function checkDirectly(username) {
     
     const html = await response.text();
     
+    // Get first 1000 chars to see what page we're getting
+    const preview = html.substring(0, 1000);
+    
     return {
       statusCode: response.status,
       size: html.length,
-      hasProfile: html.toLowerCase().includes(`"${username.toLowerCase()}"`)
+      hasProfile: html.toLowerCase().includes(`"${username.toLowerCase()}"`),
+      preview: preview,
+      title: html.match(/<title>(.*?)<\/title>/)?.[1] || 'No title found'
     };
   } catch (error) {
     return { error: error.message };
