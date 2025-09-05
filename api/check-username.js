@@ -5,7 +5,7 @@ export default async function handler(req, res) {
   
   const USERNAME_TO_CHECK = 'zubinmowlavizubinmowlavi';  // Test with non-existent username
   const SECRET_KEY = process.env.SECRET_KEY || 'your-secret-key-here';
-  
+  // Force redeploy - v2
   const { key, sendAlert, debug } = req.query;
   
   // Check authorization
