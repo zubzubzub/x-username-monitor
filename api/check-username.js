@@ -3,7 +3,7 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST');
   
-  const USERNAME_TO_CHECK = 'xyz123abc789def';
+  const USERNAME_TO_CHECK = 'zubinmowlavizubinmowlavi';
   const SECRET_KEY = process.env.SECRET_KEY || 'your-secret-key-here';
   
   const { key, sendAlert, debug } = req.query;
