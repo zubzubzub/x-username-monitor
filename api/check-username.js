@@ -7,174 +7,137 @@ export default async function handler(req, res) {
   const SECRET_KEY = process.env.SECRET_KEY || 'your-secret-key-here';
   
   const { key, sendAlert, debug } = req.query;
+  
+  // Check authorization
   if (key !== SECRET_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   
   try {
-    // Add debug mode to see what's happening
-    const checkResult = await checkUsernameAvailability(USERNAME_TO_CHECK, debug === 'true');
+    // Check username availability
+    const result = await checkUsernameAvailability(USERNAME_TO_CHECK);
     
-    if (sendAlert === 'true' && checkResult.available) {
-      await sendSMS(`🚨 @${USERNAME_TO_CHECK} is NOW AVAILABLE on X! Claim it at x.com/${USERNAME_TO_CHECK}`);
+    // Send SMS if requested and username is available
+    if (sendAlert === 'true' && result.available === true) {
+      try {
+        await sendSMS(`🚨 @${USERNAME_TO_CHECK} is NOW AVAILABLE on X! Claim it at x.com/${USERNAME_TO_CHECK}`);
+      } catch (smsError) {
+        console.error('SMS failed:', smsError);
+      }
     }
     
-    res.status(200).json({
+    // Return response
+    const response = {
       username: USERNAME_TO_CHECK,
-      available: checkResult.available,
+      available: result.available,
       timestamp: new Date().toISOString(),
-      message: checkResult.available ? 'Username is available!' : 'Username is taken or suspended',
-      debug: debug === 'true' ? checkResult.debug : undefined
-    });
+      message: result.available ? 'Username is available!' : 'Username is taken or suspended'
+    };
+    
+    // Add debug info if requested
+    if (debug === 'true') {
+      response.debug = result.debug;
+    }
+    
+    return res.status(200).json(response);
     
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ 
+    console.error('Error in handler:', error);
+    return res.status(500).json({ 
       error: 'Failed to check username',
-      details: error.message 
+      details: error.message || 'Unknown error'
     });
   }
 }
 
-async function checkUsernameAvailability(username, includeDebug = false) {
+async function checkUsernameAvailability(username) {
   const debugInfo = {};
   
   try {
-    // Try to fetch the X profile page
     const url = `https://x.com/${username}`;
+    debugInfo.checkingUrl = url;
+    
     const response = await fetch(url, {
-      method: 'GET',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache'
-      },
-      redirect: 'follow'
+        'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+      }
     });
     
     debugInfo.statusCode = response.status;
-    debugInfo.url = response.url;
     
-    // Get the response text
-    const text = await response.text();
-    debugInfo.responseLength = text.length;
-    debugInfo.firstChars = text.substring(0, 500);
+    // Read the response
+    const html = await response.text();
+    debugInfo.responseSize = html.length;
     
-    // Check various indicators of availability
-    const textLower = text.toLowerCase();
+    // Simple check: look for clear indicators the username exists
+    const pageContent = html.toLowerCase();
     
-    // Indicators that the account EXISTS (is taken)
-    const accountExistsIndicators = [
-      '"screen_name":"' + username.toLowerCase() + '"',
-      '@' + username.toLowerCase(),
-      'property="og:title"',
-      'property="og:description"',
-      '"profile_image_url":',
-      '"followers_count":',
-      'data-testid="UserName"'
-    ];
-    
-    const accountExists = accountExistsIndicators.some(indicator => 
-      textLower.includes(indicator.toLowerCase())
-    );
-    
-    if (accountExists) {
-      debugInfo.reason = 'Found account indicators in page';
-      debugInfo.detectedPattern = accountExistsIndicators.find(i => textLower.includes(i.toLowerCase()));
-      return {
-        available: false,
-        debug: includeDebug ? debugInfo : undefined
-      };
+    // Strong indicators the account EXISTS
+    if (pageContent.includes(`"screen_name":"${username.toLowerCase()}"`) ||
+        pageContent.includes(`@${username.toLowerCase()}`) && pageContent.includes('followers')) {
+      debugInfo.detected = 'Account exists - found username in page data';
+      return { available: false, debug: debugInfo };
     }
     
-    // Indicators that the account is SUSPENDED
-    const suspendedIndicators = [
-      'account has been suspended',
-      'account suspended',
-      'suspended account'
-    ];
-    
-    const isSuspended = suspendedIndicators.some(indicator => 
-      textLower.includes(indicator)
-    );
-    
-    if (isSuspended) {
-      debugInfo.reason = 'Account is suspended';
-      return {
-        available: false, // Suspended accounts aren't immediately available
-        debug: includeDebug ? debugInfo : undefined
-      };
+    // Check if page says account doesn't exist
+    if (pageContent.includes("this account doesn't exist") ||
+        pageContent.includes("this account does not exist")) {
+      debugInfo.detected = 'Account does not exist message found';
+      return { available: true, debug: debugInfo };
     }
     
-    // Indicators the page doesn't exist or account is available
-    const notExistsIndicators = [
-      'this account doesn't exist',
-      'this account does not exist',
-      'page doesn't exist',
-      'page does not exist',
-      'something went wrong',
-      'this page is not available'
-    ];
-    
-    const doesNotExist = notExistsIndicators.some(indicator => 
-      textLower.includes(indicator)
-    );
-    
-    if (doesNotExist) {
-      debugInfo.reason = 'Found "does not exist" indicator';
-      return {
-        available: true,
-        debug: includeDebug ? debugInfo : undefined
-      };
+    // Check if account is suspended
+    if (pageContent.includes('account suspended') || 
+        pageContent.includes('account has been suspended')) {
+      debugInfo.detected = 'Account is suspended';
+      return { available: false, debug: debugInfo };
     }
     
-    // Check for 404 status
+    // If we get a 404, username might be available
     if (response.status === 404) {
-      debugInfo.reason = '404 status code';
-      return {
-        available: true,
-        debug: includeDebug ? debugInfo : undefined
-      };
+      debugInfo.detected = '404 status - username likely available';
+      return { available: true, debug: debugInfo };
     }
     
-    // If we find no clear indicators, check page size
-    // X profile pages are typically large (>50KB), error pages are small
-    if (text.length < 20000) {
-      debugInfo.reason = 'Small page size suggests error/not found';
-      return {
-        available: true,
-        debug: includeDebug ? debugInfo : undefined
-      };
+    // Default: if page loads with content, assume taken
+    if (html.length > 10000) {
+      debugInfo.detected = 'Large page size - likely a profile';
+      return { available: false, debug: debugInfo };
+    } else {
+      debugInfo.detected = 'Small page size - might be error page';
+      return { available: true, debug: debugInfo };
     }
-    
-    // Default: if we got a normal response with content, account likely exists
-    debugInfo.reason = 'Default: appears to be a profile page';
-    return {
-      available: false,
-      debug: includeDebug ? debugInfo : undefined
-    };
     
   } catch (error) {
-    console.error('Error checking username:', error);
-    debugInfo.error = error.message;
-    return {
-      available: false, // Be conservative on errors
-      debug: includeDebug ? debugInfo : undefined
+    console.error('Error in availability check:', error);
+    // On error, assume not available to avoid false positives
+    return { 
+      available: false, 
+      debug: { 
+        error: error.message,
+        ...debugInfo 
+      }
     };
   }
 }
 
 async function sendSMS(message) {
-  if (process.env.TWILIO_ACCOUNT_SID) {
+  // Only try Twilio if configured
+  if (!process.env.TWILIO_ACCOUNT_SID || !process.env.YOUR_PHONE_NUMBER) {
+    console.log('SMS not configured');
+    return null;
+  }
+  
+  try {
     const accountSid = process.env.TWILIO_ACCOUNT_SID;
     const authToken = process.env.TWILIO_AUTH_TOKEN;
     const fromPhone = process.env.TWILIO_PHONE_FROM;
     const toPhone = process.env.YOUR_PHONE_NUMBER;
     
+    // Create auth header
     const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
     
+    // Send SMS via Twilio
     const response = await fetch(
       `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`,
       {
@@ -192,31 +155,14 @@ async function sendSMS(message) {
     );
     
     if (!response.ok) {
-      throw new Error(`Twilio error: ${response.statusText}`);
+      const error = await response.text();
+      throw new Error(`Twilio error: ${error}`);
     }
-    return await response.json();
-  }
-  
-  else if (process.env.YOUR_PHONE_NUMBER) {
-    const response = await fetch('https://textbelt.com/text', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        phone: process.env.YOUR_PHONE_NUMBER,
-        message: message,
-        key: process.env.TEXTBELT_KEY || 'textbelt'
-      })
-    });
     
-    const result = await response.json();
-    if (!result.success) {
-      throw new Error(`TextBelt error: ${result.error}`);
-    }
-    return result;
+    return await response.json();
+    
+  } catch (error) {
+    console.error('SMS error:', error);
+    throw error;
   }
-  
-  console.log('SMS not configured, skipping notification');
-  return null;
 }
